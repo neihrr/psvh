@@ -83,7 +83,6 @@ def build_pascal_metadata(root_dir, categories):
                                     # Ensure viewpoint exists before accessing it
                                     if not hasattr(obj, 'viewpoint') or obj.viewpoint == [] or obj.occluded == 1 :
                                         continue  
-                                    get_6d_pose_vector(azimuth=float(obj.viewpoint.azimuth), elevation=float(obj.viewpoint.elevation), theta=float(obj.viewpoint.theta), distance= float(obj.viewpoint.distance) )                                        
                                     entry = {
                                         "image_path": os.path.join(root_dir,'Images', subset, getattr(record, 'filename', file.replace('.mat', '.JPEG'))),
                                         "anno_path": file_path,
@@ -110,7 +109,7 @@ def build_pascal_metadata(root_dir, categories):
     print(f"\nSUCCESS: Metadata saved to {METADATA_PATH}")
 
 # Run the updated function
-build_pascal_metadata(ROOT_PATH, ['chair', 'car', 'aeroplane', 'sofa']) #['chair', 'car', 'aeroplane', 'sofa']
+#build_pascal_metadata(ROOT_PATH, ['chair']) #['chair', 'car', 'aeroplane', 'sofa']
 
 def voxelize_cad(off_path, grid_size=32):
     """Converts a 3D .off mesh into a 32x32x32 binary voxel grid."""
@@ -295,28 +294,30 @@ def visualize_voxels_with_axes(voxels, title="Voxel Check"):
     ax.set_title(title)
     plt.legend()
     plt.show()
+
 def verify_voxels(voxel_path):
+    """Calculates center offset and max radius to ensure PSVH compliance."""
     voxels = np.load(voxel_path)
     occupied_indices = np.argwhere(voxels > 0.5)
     
     if len(occupied_indices) == 0:
-        return "Empty voxel grid!"
+        return {"is_psvh_compliant": False, "error": "Empty voxel grid!"}
 
-    # 1. Position Check: Center of occupancy
+    # Position Check: Mean of all occupied voxels (Ideal: 15.5 for a 32-grid)
     center = np.mean(occupied_indices, axis=0)
+    center_offset = np.linalg.norm(center - 15.5)
     
-    # 2. Scale Check: Maximum distance from center
-    # Grid is 32x32x32, so center should be ~15.5. 
-    # Max radius should be ~16 voxels (0.5 of the 32-unit cube)
+    # Scale Check: Max distance from center (Ideal: 16.0 for Radius 0.5)
+    # The PSVH paper explicitly uses a radius-0.5 sphere for normalization.
     relative_coords = occupied_indices - np.array([15.5, 15.5, 15.5])
     max_radius = np.max(np.linalg.norm(relative_coords, axis=1))
     
     return {
-        "center_offset": np.linalg.norm(center - 15.5),
-        "max_radius_voxels": max_radius,
-        "is_scaled_correctly": 14 < max_radius <= 16 # roughly 0.45-0.5 radius
+        "center_offset": round(float(center_offset), 4),
+        "max_radius_voxels": round(float(max_radius), 4),
+        # Using the key name your loop expects:
+        "is_psvh_compliant": center_offset < 2.0 and 14.0 <= max_radius <= 16.5
     }
-
 # ============================================================
 # CALCULATING 6D VECTOR FROM AZIMUTH ELEVATION THETA DISTANCE, THIS IS REQUIRED FOR FINE TUNING
 # ============================================================
