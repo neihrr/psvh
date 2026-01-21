@@ -18,8 +18,36 @@ METADATA_PATH = '/Users/nehirgulcecesmeci/Desktop/pascal_metadata.json'
 SAVE_DIR = '/Users/nehirgulcecesmeci/Desktop/ibcc'
 MASK_SAVE_DIR = os.path.join(SAVE_DIR, 'masks')
 VOXEL_SAVE_DIR = os.path.join(SAVE_DIR, 'voxels')
+FAILED_VOXEL_DIR = os.path.join(SAVE_DIR, 'failed_voxels')
 os.makedirs(MASK_SAVE_DIR, exist_ok=True)
 os.makedirs(VOXEL_SAVE_DIR, exist_ok=True)
+
+""" # ============================================================
+# AUTO-FIT 2D PROJECTION INTO IMAGE
+# ============================================================
+def fit_projection_to_image(proj, img_size=224, margin=10):
+    min_xy = proj.min(axis=0)
+    max_xy = proj.max(axis=0)
+
+    size = max_xy - min_xy
+    scale = (img_size - 2 * margin) / max(size)
+
+    proj = (proj - min_xy) * scale + margin
+    return proj """
+""" def voxelize_cad(off_path, grid_size=32):
+    #Converts a 3D .off mesh into a 32x32x32 binary voxel grid
+    mesh = trimesh.load(off_path)
+    # Center the mesh at the origin and normalize scale
+    mesh.apply_translation(-mesh.centroid)
+    
+    # Create the voxel grid
+    voxels = mesh.voxelized(pitch=mesh.extents.max()/grid_size).matrix
+    
+    # Ensure it is exactly the shape the network expects
+    # Pad or crop to (32, 32, 32)
+    return voxels """
+
+
 
 def build_pascal_metadata(root_dir, categories):
     print("🛠️ Building PASCAL 3D+ metadata...")
@@ -111,18 +139,45 @@ def build_pascal_metadata(root_dir, categories):
 # Run the updated function
 #build_pascal_metadata(ROOT_PATH, ['chair']) #['chair', 'car', 'aeroplane', 'sofa']
 
-def voxelize_cad(off_path, grid_size=32):
-    """Converts a 3D .off mesh into a 32x32x32 binary voxel grid."""
-    mesh = trimesh.load(off_path)
-    # Center the mesh at the origin and normalize scale
-    mesh.apply_translation(-mesh.centroid)
+def print_voxel_report(stats_tracker):
+    """Prints a detailed mathematical summary of the preprocessing quality."""
+    print("\n" + "="*55)
+    print("📊 DETAILED VOXEL QUALITY AUDIT")
+    print("="*55)
     
-    # Create the voxel grid
-    voxels = mesh.voxelized(pitch=mesh.extents.max()/grid_size).matrix
-    
-    # Ensure it is exactly the shape the network expects
-    # Pad or crop to (32, 32, 32)
-    return voxels
+    for cat, s in stats_tracker.items():
+        total = s['total_unique']
+        if total == 0:
+            print(f"Category: {cat.upper()} - No data processed.")
+            continue
+
+        # Extract values for math
+        details = s.get("details", [])
+        offsets = [d['center_offset'] for d in details]
+        radii = [d['max_radius_voxels'] for d in details]
+        
+        avg_offset = np.mean(offsets)
+        avg_radius = np.mean(radii)
+        max_offset = np.max(offsets)
+        
+        pass_rate = (s['pass'] / total) * 100
+
+        print(f"Category: {cat.upper()}")
+        print(f"  - Unique CADs:    {total}")
+        print(f"  - Success Rate:   {pass_rate:.2f}% {'🟢' if pass_rate > 90 else '🟡'}")
+        print(f"  - Passed:         {s['pass']} ✅")
+        print(f"  - Failed:         {s['fail']} ❌")
+        print("-" * 20)
+        print(f"  - Avg Offset:     {avg_offset:.4f} (Goal: < 1.5)")
+        print(f"  - Max Offset:     {max_offset:.4f} (Worst Case)")
+        print(f"  - Avg Max Radius: {avg_radius:.4f} (Goal: ~15.5)")
+        
+        if max_offset > 2.5:
+            print(f"  ⚠️ ALERT: High offsets detected. Some models are poorly centered.")
+        print("-" * 55)
+
+    print("🎉 Report Complete. Failed models are in /failed_voxels for inspection.\n")
+
 
 def save_pseudo_gt(save_dir, img_id, mask, d_corrected):
     """Saves the generated mask as an image and prepares the metadata entry."""
@@ -176,25 +231,22 @@ def load_off(path):
     return verts, faces
 
 # ============================================================
-# NORMALIZE CAD MODEL SCALE
+# MASK & POSE UTILS
 # ============================================================
 def normalize_vertices_to_psvh_scale(vertices):
-    """Aligns scaling logic with the PSVH radius-0.5 requirement."""
     center = vertices.mean(axis=0)
     verts = vertices - center
     max_dist = np.max(np.linalg.norm(verts, axis=1))
-    # PSVH scale: radius = 0.5
-    scale_factor = 0.5 / max_dist
-    return verts * scale_factor
+    return verts * (0.5 / max_dist)
 
 # ============================================================
-# PROJECT 3D → 2D (DEPTH OPTIONAL)
+# PROJECT 3D → 2D 
 # ============================================================
 def project_3d_to_2d(
     model_pts,
-    azimuth,
-    elevation,
-    theta,
+    azimuth, #horizontal location
+    elevation, #vertical tilt
+    theta, #camera roll
     d,
     f=2000,
     img_size=224,
@@ -202,69 +254,70 @@ def project_3d_to_2d(
 ):
     a, e, t = np.radians(azimuth), np.radians(elevation), np.radians(theta)
 
+
+    #Defining the rotation matrices Rz, Rx, Rt
+
+    #Rz (Azimuth): Rotates the object around its vertical axis.
     Rz = np.array([[np.cos(a), -np.sin(a), 0],
                    [np.sin(a),  np.cos(a), 0],
                    [0,          0,         1]])
+    
+    #Rx (Elevation): Tilts the object up or down.
     Rx = np.array([[1, 0, 0],
                    [0, np.cos(e), -np.sin(e)],
                    [0, np.sin(e),  np.cos(e)]])
+    
+    #Rt (Theta/Roll): Rotates the object around the viewing axis (tilting the "camera").
     Rt = np.array([[np.cos(t), -np.sin(t), 0],
                    [np.sin(t),  np.cos(t), 0],
                    [0,          0,         1]])
 
+    #The combination of rotation matrix
     R = Rt @ Rx @ Rz
     pts = (R @ model_pts.T).T
 
-    z = pts[:, 2] + d
+    #after rotation the points are centeredt at (0,0,0)
+    #we add d to the z to move the object from the camera
+    z = pts[:, 2] + d #d is the distance of the camera from the object 
+
+    #the principle of similar triangles (to project x,y,z (3D) into x,y (2D))
+    #f determines the zoom (when f is higher object will appear larger)
     proj = f * pts[:, :2] / z[:, None]
 
-    proj += img_size / 2
+    proj += img_size / 2 #this is to center the image so that it doesn't appear on the top left corner
 
     if return_depth:
         return proj, z
     return proj
 
 # ============================================================
-# AUTO-FIT 2D PROJECTION INTO IMAGE
-# ============================================================
-def fit_projection_to_image(proj, img_size=224, margin=10):
-    min_xy = proj.min(axis=0)
-    max_xy = proj.max(axis=0)
-
-    size = max_xy - min_xy
-    scale = (img_size - 2 * margin) / max(size)
-
-    proj = (proj - min_xy) * scale + margin
-    return proj
-
-# ============================================================
-# 3D ALIGNMENT & VOXELIZATION (RADIUS-0.5 REQUIREMENT)
+# MAKE SURE THE 3D MODEL IS UPROGHT AND CENTERED
 # ============================================================
 def align_to_canonical(off_path, grid_size=32):
-    """
-    Replaces old voxelize_cad.
-    Centers mesh, scales to radius-0.5, and voxelizes to 32x32x32.
-    """
+
     mesh = trimesh.load(off_path)
     
-    # 1. Center the mesh at the origin
-    mesh.apply_translation(-mesh.centroid)
+    #center the image
+    bbox_center = mesh.bounding_box.centroid
+    mesh.apply_translation(-bbox_center)
     
-    # 2. Normalize scale: fit in a radius-0.5 sphere
-    # (Distance from center to furthest vertex = 0.5)
+    #scale: Normalize to Radius 0.5 --> paper standart
+    #fits the entire object within a sphere of radius 0.5
     max_dist = np.max(np.linalg.norm(mesh.vertices, axis=1))
     scale_factor = 0.5 / max_dist
     mesh.apply_scale(scale_factor)
     
-    # 3. Voxelize
-    # We use pitch=1.0/grid_size so the unit cube (1.0) maps to 32 voxels
-    voxels_obj = mesh.voxelized(pitch=1.0/grid_size)
+    #voxelize
+    #pitch is the size of one voxel 
+    #pitch is set to 1/32 
+    # it supposed to be that the total object width is roughly 1.0, this should theoretically result in about 32 voxels across 
+    # TODO:check if the total object width is 1
+    voxels_obj = mesh.voxelized(pitch=1.0/grid_size) 
     voxels = voxels_obj.matrix
     
-    # 4. Ensure exact (32, 32, 32) shape via padding/cropping
+    # pad/crop to exactly (32, 32, 32)
     final_voxels = np.zeros((grid_size, grid_size, grid_size), dtype=np.uint8)
     v_shape = voxels.shape
-    
     sz = [min(grid_size, s) for s in v_shape]
     start = [(grid_size - s) // 2 for s in sz]
     v_start = [(s - min_s) // 2 for s, min_s in zip(v_shape, sz)]
@@ -276,17 +329,23 @@ def align_to_canonical(off_path, grid_size=32):
                                                    v_start[2]:v_start[2]+sz[2]]
     return final_voxels
 
+
+# ============================================================
+# Visualizes 3D voxels and indicates the z-axis. To verify the orientation and spatial alignment
+# ============================================================
 def visualize_voxels_with_axes(voxels, title="Voxel Check"):
-    """Visualizes 3D voxels and indicates the Z-axis."""
+    #voxels should be a 3D NumPy array of booleans
+    #creates a figure and specifies a 3d projection
     fig = plt.figure(figsize=(8, 8))
     ax = fig.add_subplot(111, projection='3d')
     
     # Plot voxels
-    ax.voxels(voxels, edgecolor='k', alpha=0.7)
+    # voxels are 3D NumPy array of booleans
+    ax.voxels(voxels, edgecolor='k', alpha=0.7) #this visualizes the actual shape of the 3D data.
     
     # Draw Z-axis (Red Arrow) to check orientation
     # In canonical space, Z is often the 'depth' or 'forward' axis
-    ax.quiver(16, 16, 16, 0, 0, 15, color='red', lw=3, label='Positive Z (Forward)')
+    ax.quiver(16, 16, 16, 0, 0, 15, color='red', lw=3, label='Positive Z (Forward)') #This ensures the "Forward" or "Up" direction is correct.
     
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
@@ -295,29 +354,40 @@ def visualize_voxels_with_axes(voxels, title="Voxel Check"):
     plt.legend()
     plt.show()
 
-def verify_voxels(voxel_path):
-    """Calculates center offset and max radius to ensure PSVH compliance."""
-    voxels = np.load(voxel_path)
-    occupied_indices = np.argwhere(voxels > 0.5)
-    
-    if len(occupied_indices) == 0:
-        return {"is_psvh_compliant": False, "error": "Empty voxel grid!"}
 
-    # Position Check: Mean of all occupied voxels (Ideal: 15.5 for a 32-grid)
+# ============================================================
+# DECIDE IF THE VOXELS FITS THE REQUIREMENTS TO BE COMPLIANT
+# ============================================================
+def verify_voxels_from_matrix(voxels):
+    """Calculates center offset and max radius to ensure PSVH compliance."""
+
+    #to find all "occupied" space
+    occupied_indices = np.argwhere(voxels > 0.5)
+    if len(occupied_indices) == 0:
+        return {"is_psvh_compliant": False, "center_offset": 99, "max_radius_voxels": 0}
+
+    # Because our voxel size is 32x32x32 the absolute center of this box is 15.5 in all three dimensions (x,y,z)
     center = np.mean(occupied_indices, axis=0)
-    center_offset = np.linalg.norm(center - 15.5)
+    # center_offset tells how off center the the object is sitting
+    # If this value is high (e.g., >2.5), the model is "leaning" or "pushed" to one side of the box
+    center_offset = np.linalg.norm(center - 15.5) #the euclidian distance between the geometric center of the model (chair or whatever) and the mathematical center of the voxel box (15.5)
     
-    # Scale Check: Max distance from center (Ideal: 16.0 for Radius 0.5)
-    # The PSVH paper explicitly uses a radius-0.5 sphere for normalization.
-    relative_coords = occupied_indices - np.array([15.5, 15.5, 15.5])
+    #relative_coords takes the location of every single filled voxel and subtracts 15.5 from it
+    relative_coords = occupied_indices - np.array([15.5, 15.5, 15.5]) #shifts the coordinate system so that (0,0,0) is the center of the grid.
+    
+    #finds the single voxel that is furthest away from the center (15.5) being the max radius of the spehere(if we imagine sphere surrounding our object)
+    # If it's too small (<13), the model is a tiny speck in a giant box, wasting resolution.
+    # If it's too large (>17.5), the model is "clipping" through the walls of the 32x32x32 grid
+    # meaning parts of the model are being cut off and los
     max_radius = np.max(np.linalg.norm(relative_coords, axis=1))
     
     return {
         "center_offset": round(float(center_offset), 4),
         "max_radius_voxels": round(float(max_radius), 4),
-        # Using the key name your loop expects:
-        "is_psvh_compliant": center_offset < 2.0 and 14.0 <= max_radius <= 16.5
+        #the grid ends at 16 (from the center) but we allow 17.5 allows the object to almost touch the corners otherwise they all fail if we define this 16 or 16.5
+        "is_psvh_compliant": center_offset < 2.5 and 13.0 <= max_radius <= 17.5
     }
+
 # ============================================================
 # CALCULATING 6D VECTOR FROM AZIMUTH ELEVATION THETA DISTANCE, THIS IS REQUIRED FOR FINE TUNING
 # ============================================================
@@ -341,50 +411,34 @@ def get_6d_pose_vector(azimuth, elevation, theta, distance, img_size=224, mask=N
     # 3. Final 6D vector p = [theta1, theta2, theta3, tu, tv, tZ]
     p = [float(theta1), float(theta2), float(theta3), float(tu), float(tv), float(distance)]
     return p
+
+
 # ============================================================
-# FAST SILHOUETTE GENERATION (NO PYTHON PIXEL LOOPS)
+# CREATE THE 2D SILHOUTTE FROM 3D CAD MODEL BASED ON THE CMAERA VIEWPOINT DEFINED BY --> azimuth, elevation, theta, d_opt
 # ============================================================
-def generate_cad_mask(
-    vertices,
-    azimuth,
-    elevation,
-    theta,
-    d_opt,
-    cad_faces,
-    img_size=224,
-    smooth=True
-):
-    # Normalize model scale (CRITICAL)
-    vertices = normalize_vertices_to_psvh_scale(vertices)
+def generate_cad_mask(vertices, azimuth, elevation, theta, d_opt, cad_faces, img_size=224, smooth=True):
+    vertices = normalize_vertices_to_psvh_scale(vertices) #performs scaling
+    proj = project_3d_to_2d(vertices, azimuth, elevation, theta, d_opt, f=2000, img_size=img_size) #calculating where 3D point (vertex) would land on a 2D image plane
+    proj = np.round(proj).astype(np.int32) #coordinates are rounded to the nearest integer to correspond to actual pixel locations
+    
+    #drawing the mask
+    mask = np.zeros((img_size, img_size), dtype=np.uint8) #initialize a black canvas for the mask
 
-    # Project
-    proj = project_3d_to_2d(
-        vertices, azimuth, elevation, theta, d_opt, f=2000,
-        img_size=img_size, return_depth=False
-    )
-
-    # 3. IMPORTANT: The PSVH paper DOES NOT 'fit to image' for masks.
-    # The mask's position is determined by the pose (azimuth, elev, tu, tv, d).
-    # If you use fit_projection_to_image, you are overwriting the 'tu' and 'tv' 
-    # the network is trying to learn. 
-    # REMOVE: proj = fit_projection_to_image(proj, img_size)
-
-    proj = np.round(proj).astype(np.int32)
-
-    mask = np.zeros((img_size, img_size), dtype=np.uint8)
-
-    # FAST: fill triangles directly with OpenCV
+    #cad_faces are the triangles that make up the 3D surface
     for face in cad_faces:
-        tri = proj[face]
-        if cv2.contourArea(tri) > 1:
-            cv2.fillConvexPoly(mask, tri, 255)
+        tri = proj[face] #grab the face 
+        if cv2.contourArea(tri) > 0.5: #to ensure that the face is large enough to be considered visible
+            cv2.fillConvexPoly(mask, tri, 255) #color the interior of the triangle white on the mask
 
+    #refinement section
     if smooth:
-        mask = cv2.GaussianBlur(mask, (5, 5), 0)
-        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-
+        mask = cv2.GaussianBlur(mask, (5, 5), 0) #softens the edges of the white mask, creating a slight gray gradient at the borders
+        _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY) #converts the blurred image back into strictly black and white with the treshold of 127
     return mask
 
+# ============================================================
+# OPTIMIZE THE CAMERA DISTANCE (find the exact distance that makes the 3D points line up perfectly with the 2D pixels)
+# ============================================================
 def optimize_distance(image_landmarks, model_3d_pts, azimuth, elevation, theta):
     """Finds the 'd' that minimizes the distance between projected and real points."""
     
@@ -402,6 +456,8 @@ def optimize_distance(image_landmarks, model_3d_pts, azimuth, elevation, theta):
 # MAIN PROCESSING LOOP
 # ============================================================
 def get_ready_for_training(visualize_first_n=3):
+
+    #handle the data initialization and loading
     landmark_fields = ['back_upper_left', 'back_upper_right', 'seat_upper_left', 'seat_upper_right',
                        'seat_lower_left', 'seat_lower_right', 'leg_upper_left', 'leg_upper_right',
                        'leg_lower_left', 'leg_lower_right']
@@ -409,11 +465,14 @@ def get_ready_for_training(visualize_first_n=3):
     with open(METADATA_PATH, 'r') as f:
         metadata = json.load(f)
 
+    stats_tracker = {}
+
     for cat, images in metadata.items():
         print(f"\n🚀 Processing category: {cat}")
+        stats_tracker[cat] = {"pass": 0, "fail": 0, "total_unique": 0, "details":[]}
+        
         master_mat_path = os.path.join(ROOT_PATH, 'CAD', f"{cat}.mat")
         if not os.path.exists(master_mat_path): continue
-        
         master_data = sio.loadmat(master_mat_path, struct_as_record=False, squeeze_me=True)
         cad_models = master_data.get(cat, master_data.get('model'))
         if not isinstance(cad_models, (list, np.ndarray)): cad_models = [cad_models]
@@ -425,8 +484,10 @@ def get_ready_for_training(visualize_first_n=3):
                 cad_idx = entry['cad_index']
                 current_model = cad_models[cad_idx-1]
                 cad_path_off = os.path.join(ROOT_PATH, 'CAD', cat, f"{cad_idx:02d}.off")
+                voxel_key = f"{cat}_{cad_idx:02d}"
+                voxel_file = os.path.join(VOXEL_SAVE_DIR, f"{voxel_key}.npy")
 
-                # 1. Optimize distance
+                # 1. DISTANCE OPTIMIZATION
                 image_landmarks_dict = get_2d_landmarks_with_names(entry['anno_path'])
                 aligned_2d, aligned_3d = [], []
                 for field in landmark_fields:
@@ -437,47 +498,56 @@ def get_ready_for_training(visualize_first_n=3):
 
                 new_d = entry['distance']
                 if len(aligned_2d) >= 3:
-                    new_d = optimize_distance(np.array(aligned_2d), np.array(aligned_3d), 
-                                              entry['azimuth'], entry['elevation'], entry['theta'])
+                    new_d = optimize_distance(np.array(aligned_2d), np.array(aligned_3d), entry['azimuth'], entry['elevation'], entry['theta'])
 
-                # 2. Generate Mask
+                # 2. VOXELIZATION & COMPLIANCE FILTER
+                if voxel_key not in voxel_cache:
+                    voxels = align_to_canonical(cad_path_off) #ensure the alignment of the voxel
+                    v_stats = verify_voxels_from_matrix(voxels)  #to have the statistics about if the 3d model fits the requirements
+                    stats_tracker[cat]["total_unique"] += 1
+                    stats_tracker[cat]["details"].append(v_stats)
+                    
+                    if v_stats["is_psvh_compliant"]:
+                        np.save(voxel_file, voxels)
+                        stats_tracker[cat]["pass"] += 1
+                        voxel_cache[voxel_key] = voxel_file
+                    else:
+                        # Move to failed directory for inspection
+                        fail_path = os.path.join(FAILED_VOXEL_DIR, f"{voxel_key}_FAIL.npy")
+                        np.save(fail_path, voxels)
+                        stats_tracker[cat]["fail"] += 1
+                        voxel_cache[voxel_key] = fail_path # Reference the fail path in JSON
+                        print(f"  ⚠️ Junk Filter: {voxel_key} failed (Offset: {v_stats['center_offset']})")
+
+                    if count < visualize_first_n:
+                        visualize_voxels_with_axes(voxels, title=f"{voxel_key} - Radius: {v_stats['max_radius_voxels']}")
+
+                # 3. MASK GENERATION
                 cad_vertices, cad_faces = load_off(cad_path_off)
-                mask = generate_cad_mask(cad_vertices, entry['azimuth'], entry['elevation'], entry['theta'], new_d, cad_faces)
+                mask = generate_cad_mask(cad_vertices, entry['azimuth'], entry['elevation'], entry['theta'], new_d, cad_faces) #create the 2D silhouette
                 _, mask_path = save_pseudo_gt(MASK_SAVE_DIR, img_id, mask, new_d)
 
-                # 3. Canonical Voxelization (Radius 0.5)
-                voxel_key = f"{cat}_{cad_idx:02d}"
-                voxel_file = os.path.join(VOXEL_SAVE_DIR, f"{voxel_key}.npy")
-                
-                if voxel_key not in voxel_cache:
-                    # UPDATED: Using align_to_canonical instead of voxelize_cad
-                    voxels = align_to_canonical(cad_path_off)
-                    np.save(voxel_file, voxels)
-                    voxel_cache[voxel_key] = voxel_file
-                    
-                    stats = verify_voxels(voxel_file)
-                    print(f"📊 Voxel Stats for {voxel_key}: {stats}")
-                    
-                    if not stats["is_psvh_compliant"]:
-                        print(f"⚠️ WARNING: {voxel_key} might be misaligned or incorrectly scaled!")
-                    
-                    if count < visualize_first_n:
-                        visualize_voxels_with_axes(voxels, title=f"Check: {voxel_key}\nRadius: {stats['max_radius_voxels']}")
+                # 4. UPDATE METADATA
+                entry.update({
+                    'pose_6d': get_6d_pose_vector(entry['azimuth'], entry['elevation'], entry['theta'], new_d, mask=mask),
+                    'corrected_d': float(new_d),
+                    'mask_path': mask_path,
+                    'voxel_gt_path': voxel_cache[voxel_key]
+                })
 
-                # 4. Final Metadata Update
-                entry['pose_6d'] = get_6d_pose_vector(entry['azimuth'], entry['elevation'], entry['theta'], new_d, mask=mask)
-                entry['corrected_d'] = float(new_d)
-                entry['mask_path'] = mask_path
-                entry['voxel_gt_path'] = voxel_file
-
-                if count % 50 == 0:
-                    print(f"  ✅ {cat}: {count}/{len(images)} processed")
+                if count % 100 == 0:
+                    print(f"  ✅ {cat}: {count}/{len(images)} images processed")
 
             except Exception as e:
                 print(f"❌ FAILED on {entry['image_path']}: {e}")
                 raise
 
+    # Final Summary Report
+    print_voxel_report(stats_tracker)
+
     with open(os.path.join(SAVE_DIR, 'pascal_metadata_training.json'), 'w') as f:
         json.dump(metadata, f, indent=4)
-    print("🎉 Done!")
-get_ready_for_training(visualize_first_n=5)
+    print("🎉 Done! Ready for Fine-Tuning.")
+
+if __name__ == "__main__":
+    get_ready_for_training(visualize_first_n=5)
